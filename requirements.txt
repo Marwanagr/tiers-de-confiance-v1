@@ -11,3 +11,4 @@ scipy
 python-multipart
 cryptography 
 passlib[bcrypt]==1.7.4
+uuid

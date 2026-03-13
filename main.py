@@ -14,6 +14,7 @@ from db import keys_col, tokens_col, posts_col
 from utils import encrypt_image, decrypt_image, verify_token
 from auth import router as auth_router
 from WatermarkingModule.engine import Watermarker
+import uuid
 
 load_dotenv()
 
@@ -239,31 +240,276 @@ async def decrypt(image_id: str, payload: dict = Body(...)):
     decrypted_bytes = decrypt_image(payload["encrypted_image"], key_data["key"])
     return {"decrypted_image": base64.b64encode(decrypted_bytes).decode()}
 
+
 @app.post("/add_post")
 async def add_post(
     user_id: str = Form(...),
+    owner_username: str = Form(...),
+    token: str = Form(...),
     caption: str = Form(...),
     image: UploadFile = File(...),
-    image_id: str = Form(...)
+    authorized_users: str = Form(default="")
 ):
     try:
+        # 1. Vérifie le token du propriétaire
+        if not verify_token(owner_username, token):
+            raise HTTPException(status_code=403, detail="Token invalide ou expiré.")
+
+        # 2. Parse la liste des utilisateurs autorisés
+        if authorized_users.strip() == "":
+            authorized_list = []
+        else:
+            authorized_list = [u.strip() for u in authorized_users.split(",") if u.strip()]
+
+        # 3. Vérifie que les users existent
+        from db import users_col
+        invalid_users = [u for u in authorized_list if not users_col.find_one({"username": u})]
+        if invalid_users:
+            raise HTTPException(status_code=404, detail=f"Utilisateurs introuvables : {invalid_users}")
+
+        # 4. Lit et vérifie l'image
         content = await image.read()
-        
-        # Vérifie la taille (max 10MB)
         if len(content) > 10 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="Image trop lourde (max 10MB).")
-        
-        # Stocke en base64 pour éviter les problèmes d'encodage
-        image_b64 = base64.b64encode(content).decode()
-        
+
+        # 5. Génère l'image_id unique
+        image_id = str(uuid.uuid4())
+
+        # 6. Génère la clé AES-256 EN PREMIER
+        generated_key = base64.b64encode(os.urandom(32)).decode()
+
+        # 7. Chiffre l'image avec la clé
+        encrypted_image = encrypt_image(content, generated_key)
+
+        # 8. Stocke l'image CHIFFRÉE
         posts_col.insert_one({
             "image_id": image_id,
             "user_id": user_id,
             "caption": caption,
-            "image": image_b64
+            "image": encrypted_image  # ← chiffrée 🔒
         })
-        return {"message": "Publication ajoutée"}
+
+        # 9. Stocke la clé avec les autorisations
+        keys_col.insert_one({
+            "image_id": image_id,
+            "user_id": user_id,
+            "owner_username": owner_username,
+            "key": generated_key,
+            "valid": True,
+            "autorisations": authorized_list,
+            "created_at": datetime.utcnow()
+        })
+
+        return {
+            "message": "Publication ajoutée avec succès.",
+            "image_id": image_id,
+            "autorisations": authorized_list
+        }
+
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+'''
+**Le changement clé :**
+```
+AVANT :
+  image_b64 = base64.b64encode(content).decode()  ← clair 🚨
+  posts_col.insert_one({ "image": image_b64 })
+
+APRÈS :
+  generated_key = ...                              ← clé d'abord
+  encrypted_image = encrypt_image(content, key)   ← chiffrement
+  posts_col.insert_one({ "image": encrypted_image }) ← chiffré ✅
+
+#Ce que fait la route dans l'ordre :**
+1. Vérifie le token du propriétaire
+2. Vérifie que les users autorisés existent en base
+3. Vérifie la taille de l'image
+4. Génère image_id (uuid)
+5. Stocke l'image → posts_col
+6. Génère clé AES-256 + stocke autorisations → keys_col 
+'''
+@app.post("/posts/{image_id}")
+def get_post(image_id: str, payload: dict = Body(default={})):
+    try:
+        username = payload.get("username")
+        token = payload.get("token")
+
+        # 1. Récupère le post
+        post = posts_col.find_one({"image_id": image_id})
+        if not post:
+            raise HTTPException(status_code=404, detail="Post non trouvé.")
+
+        # 2. Récupère les données de la clé
+        key_data = keys_col.find_one({"image_id": image_id})
+        if not key_data:
+            raise HTTPException(status_code=404, detail="Clé non trouvée.")
+
+        # 3. Vérifie si l'utilisateur est autorisé
+        is_owner = username == key_data["owner_username"]
+        is_authorized = username in key_data.get("autorisations", [])
+        has_valid_token = username and token and verify_token(username, token)
+
+        if has_valid_token and (is_owner or is_authorized):
+            # ✅ Autorisé → déchiffre et retourne image claire
+            decrypted_bytes = decrypt_image(post["image"], key_data["key"])
+            return {
+                "image_id": image_id,
+                "caption": post["caption"],
+                "image": base64.b64encode(decrypted_bytes).decode(),
+                "decrypted": True
+            }
+        else:
+            # 🔒 Non autorisé → retourne image chiffrée telle quelle
+            return {
+                "image_id": image_id,
+                "caption": post["caption"],
+                "image": post["image"],
+                "decrypted": False
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+'''
+**Le flow complet est maintenant :**
+```
+POST /add_post
+    → chiffre l'image 🔒
+    → stocke image chiffrée + clé + autorisations
+
+POST /posts/{image_id}
+    ├── sans token / non autorisé → image chiffrée 🔒
+    ├── owner                     → déchiffre ✅
+    └── user dans autorisations   → déchiffre ✅   
+'''
+
+# ---- Models ----
+class AuthorizePayload(BaseModel):
+    owner_username: str
+    token: str
+    authorized_users: list[str]  # ["bob", "charlie"]
+
+class RevokePayload(BaseModel):
+    owner_username: str
+    token: str
+
+
+@app.post("/authorize/{image_id}")
+def authorize_users(image_id: str, payload: AuthorizePayload):
+    try:
+        # 1. Vérifie le token du propriétaire
+        if not verify_token(payload.owner_username, payload.token):
+            raise HTTPException(status_code=403, detail="Token invalide ou expiré.")
+
+        # 2. Vérifie que l'image existe
+        key_data = keys_col.find_one({"image_id": image_id})
+        if not key_data:
+            raise HTTPException(status_code=404, detail="Image non trouvée.")
+
+        # 3. Vérifie que c'est bien le propriétaire
+        if key_data["owner_username"] != payload.owner_username:
+            raise HTTPException(status_code=403, detail="Vous n'êtes pas le propriétaire.")
+
+        # 4. Vérifie que les users existent
+        from db import users_col
+        invalid_users = [u for u in payload.authorized_users if not users_col.find_one({"username": u})]
+        if invalid_users:
+            raise HTTPException(status_code=404, detail=f"Utilisateurs introuvables : {invalid_users}")
+
+        # 5. Ajoute sans doublons grâce à $addToSet
+        keys_col.update_one(
+            {"image_id": image_id},
+            {"$addToSet": {"autorisations": {"$each": payload.authorized_users}}}
+        )
+
+        # 6. Retourne la liste mise à jour
+        updated = keys_col.find_one({"image_id": image_id})
+        return {
+            "message": "Accès accordé.",
+            "image_id": image_id,
+            "autorisations": updated.get("autorisations", [])
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/revoke/{image_id}/{target_username}")
+def revoke_access(image_id: str, target_username: str, payload: RevokePayload = Body(...)):
+    try:
+        # 1. Vérifie le token du propriétaire
+        if not verify_token(payload.owner_username, payload.token):
+            raise HTTPException(status_code=403, detail="Token invalide ou expiré.")
+
+        # 2. Vérifie que l'image existe
+        key_data = keys_col.find_one({"image_id": image_id})
+        if not key_data:
+            raise HTTPException(status_code=404, detail="Image non trouvée.")
+
+        # 3. Vérifie que c'est bien le propriétaire
+        if key_data["owner_username"] != payload.owner_username:
+            raise HTTPException(status_code=403, detail="Vous n'êtes pas le propriétaire.")
+
+        # 4. Vérifie que le user cible est bien dans la liste
+        if target_username not in key_data.get("autorisations", []):
+            raise HTTPException(status_code=404, detail=f"{target_username} n'est pas dans les autorisations.")
+
+        # 5. Retire le user
+        keys_col.update_one(
+            {"image_id": image_id},
+            {"$pull": {"autorisations": target_username}}
+        )
+
+        # 6. Retourne la liste mise à jour
+        updated = keys_col.find_one({"image_id": image_id})
+        return {
+            "message": f"Accès révoqué pour {target_username}.",
+            "image_id": image_id,
+            "autorisations": updated.get("autorisations", [])
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+'''
+**Résumé des 3 routes de contrôle d'accès :**
+POST /add_post                        → autorisations initiales à la création
+POST /authorize/{image_id}            → ajouter des users après coup
+DELETE /revoke/{image_id}/{username}  → retirer un user 
+'''
+#################### des routes de test
+@app.post("/test_encrypt_decrypt")
+async def test_encrypt_decrypt(image: UploadFile = File(...)):
+    try:
+        # 1. Lit l'image originale
+        original_bytes = await image.read()
+
+        # 2. Génère une clé de test
+        test_key = base64.b64encode(os.urandom(32)).decode()
+
+        # 3. Chiffre
+        encrypted = encrypt_image(original_bytes, test_key)
+
+        # 4. Déchiffre
+        decrypted_bytes = decrypt_image(encrypted, test_key)
+
+        # 5. Vérifie que original == déchiffré
+        match = original_bytes == decrypted_bytes
+
+        return {
+            "key": test_key,
+            "original_size": len(original_bytes),
+            "encrypted_size": len(encrypted),
+            "decrypted_size": len(decrypted_bytes),
+            "match": match  # ✅ doit être True
+        }
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

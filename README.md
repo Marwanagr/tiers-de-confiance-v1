@@ -656,7 +656,7 @@ Les contributions sont bienvenues ! Veuillez créer une pull request.
 
 ## 📄 Licence
 
-© 2025 Sovrizon – Tous droits réservés.
+© 2026 Sovrizon V2 – Tous droits réservés.
 
 ---
 

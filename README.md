@@ -645,9 +645,10 @@ tiers-de-confiance/
 
 Ce projet a été développé par :
 
-- **Rémy GASMI**
-- **Simon VINCENT**
-- **Loqmen ANANI**
+- **Marwane AGREBI**
+- **Malek CHAMMAKHI**
+- **Amani KRID**
+- **Youssef KHALFA**
 
 Les contributions sont bienvenues ! Veuillez créer une pull request.
 
